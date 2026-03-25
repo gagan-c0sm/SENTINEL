@@ -1,0 +1,46 @@
+# .gitignore for SENTINEL
+
+# Environment
+.env
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Data & Backups
+data/
+*.csv
+*.dump
+*.parquet
+*.json.gz
+
+# Trained models (too large for git)
+models/*.pt
+models/*.pkl
+models/*.joblib
+models/*.h5
+
+# System & IDE
+.vscode/
+.idea/
+.docker/
+.DS_Store
+Thumbs.db
+
+# Docker volumes
+sentinel_data/
+
+# Logs & Temp
+logs/
+*.log
+diagnosis_output.txt
+csv_cols.txt
+tmp_*.py
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Research docs (keep these — they're small text files)
+# !*.md
+# !*.html
