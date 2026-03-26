@@ -4,13 +4,14 @@
 **Project**: SENTINEL (Smart Energy Network Technical Intelligence & Neural Event Link)  
 **Objective**: 5-year predictive energy monitoring framework combining EIA grid data with geopolitical sentiment.  
 **Stack**: TimescaleDB (PostgreSQL 16), Python 3.10+, PyTorch Forecasting (TFT).
+**Hardware**: NVIDIA RTX 5060 (8GB VRAM), 32GB RAM.
 
 ## Behavioral Guidelines
 1. **Idempotency**: All ingestion/cleaning scripts must use `ON CONFLICT DO NOTHING` or equivalent.
 2. **Zero-Waste**: Max disk budget is 10GB. Use `TIMESTAMPTZ` and columnar compression.
 3. **UTC Everywhere**: All time-series data is stored in **UTC +00:00**.
-4. **Python Env**: Always use `d:\Projects\SENTINEL\venv\Scripts\python.exe` — system Python lacks project deps.
-5. **PYTHONPATH**: Must include `d:\Projects\SENTINEL` for module imports.
+4. **Python Env**: `c:\Users\sriha\OneDrive\Attachments\Documents\Desktop\Projects\Sentinel\venv\Scripts\python.exe`.
+5. **PYTHONPATH**: Must include `c:\Users\sriha\OneDrive\Attachments\Documents\Desktop\Projects\Sentinel` for module imports.
 
 ## Current Progress
 
@@ -20,26 +21,29 @@
 - [x] **Weather Data**: 5-year hourly backfill from Open-Meteo complete for all 25 BAs.
 - [x] **GDELT Ingestion**: 1,910 rows loaded into `raw.gdelt_events_daily` (US + Global merged, 2021-01-01 → 2026-03-25).
 
-### Phase 2: Silver Layer 🔄 IN PROGRESS
+### Phase 2: Silver Layer ✅ COMPLETE
 - [x] `src/data/build_silver.py` created — SQL-based pivot of Bronze → Silver.
-- [🔄] `clean.demand` building from `raw.eia_region_data` (~4.6GB, GROUP BY pivot running).
-- [🔄] `clean.fuel_mix` building from `raw.eia_fuel_type_data`.
+- [x] `clean.demand` populated.
+- [x] `clean.fuel_mix` populated.
 
 ### Phase 3: Gold Layer ✅ COMPLETE
 - [x] `src/features/build_features.py` created — pure SQL with CTEs + window functions.
 - [x] Executed — produced `analytics.features` (hourly × per-BA) with demand lags, weather, GDELT signals.
+- [x] Backfilled Gas Price and Nuclear Outage features.
 
-### Phase 4: Model Training — NOT STARTED
-- [ ] TFT (Temporal Fusion Transformer) as primary model.
+### Phase 4: Model Training — IN PROGRESS
+- [x] TFT (Temporal Fusion Transformer) architecture defined (`TFT_ARCHITECTURE.md`).
+- [x] Model pipeline implemented in `src/models/`.
+- [🔄] Environment setup and dependency installation.
 - [ ] Ablation study: Model A (EIA+Weather) vs Model B (EIA+Weather+GDELT).
 - [ ] XGBoost spike classifier.
 
 ## Critical Paths
 - **Database**: `sentinel` on `localhost:5432` (Size: ~5.6 GB).
 - **Transfer**: See `db_transfer_guide.md` for `pg_dump` instructions.
-- **Environment**: `PYTHONPATH` must include `d:/Projects/SENTINEL`.
-- **Venv**: `d:\Projects\SENTINEL\venv\Scripts\python.exe`.
-- **Next Task**: Run Silver layer → Run Gold layer → Begin TFT training.
+- **Environment**: `PYTHONPATH` must include `c:/Users/sriha/OneDrive/Attachments/Documents/Desktop/Projects/Sentinel`.
+- **Venv**: `c:\Users\sriha\OneDrive\Attachments\Documents\Desktop\Projects\Sentinel\venv\Scripts\python.exe`.
+- **Next Task**: Run smoke test for TFT model.
 
 ## Database Schema Overview
 

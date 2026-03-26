@@ -62,7 +62,13 @@ WITH base AS (
             (g.us_severe_conflict::DOUBLE PRECISION / NULLIF(g.us_event_count, 0)) * 10
             + (g.oil_region_event_count::DOUBLE PRECISION / NULLIF(g.global_event_count, 0)) * 10,
             0
-        )                                           AS geo_risk_index
+        )                                           AS geo_risk_index,
+
+        -- Price features (daily → broadcast to hours)
+        gp.value                                    AS gas_price,
+
+        -- Nuclear outage features (daily → broadcast to hours)
+        no.pct_outage                               AS nuclear_outage_pct
 
     FROM clean.demand d
 
@@ -77,6 +83,15 @@ WITH base AS (
     -- GDELT: daily → join on date portion
     LEFT JOIN raw.gdelt_events_daily g
         ON g.event_date = d.period::DATE
+
+    -- Gas prices: daily Henry Hub spot → join on date
+    LEFT JOIN raw.eia_gas_prices gp
+        ON gp.period = d.period::DATE
+       AND gp.series_name = 'Henry Hub Natural Gas Spot Price (Dollars per Million Btu)'
+
+    -- Nuclear outages: daily national → join on date
+    LEFT JOIN raw.eia_nuclear_outages no
+        ON no.period = d.period::DATE
 
     WHERE d.period >= :start_ts
       AND d.period <  :end_ts
@@ -105,6 +120,12 @@ featured AS (
             PARTITION BY b.ba_code ORDER BY b.period
             ROWS BETWEEN 23 PRECEDING AND CURRENT ROW
         )                                  AS demand_std_24h,
+
+        -- Gas price 7-day % change (daily, broadcast across hours)
+        CASE WHEN LAG(b.gas_price, 168) OVER w > 0 THEN
+            (b.gas_price - LAG(b.gas_price, 168) OVER w)
+            / LAG(b.gas_price, 168) OVER w * 100.0
+        ELSE NULL END                      AS gas_price_change_7d,
 
         -- Spike detection (demand deviates >2σ from 24h rolling mean)
         CASE WHEN ABS(b.demand_mw - AVG(b.demand_mw) OVER (
@@ -136,6 +157,7 @@ INSERT INTO analytics.features (
     temperature_c, humidity_pct, wind_speed_kmh, cloud_cover_pct,
     solar_radiation, hdd, cdd,
     generation_mw, supply_demand_gap, gas_pct, renewable_pct, interchange_mw,
+    gas_price, gas_price_change_7d, nuclear_outage_pct,
     sentiment_mean_24h, sentiment_min_24h, event_count_24h, geo_risk_index,
     is_spike, spike_magnitude
 )
@@ -148,6 +170,7 @@ SELECT
     temperature_c, humidity_pct, wind_speed_kmh, cloud_cover_pct,
     solar_radiation, hdd, cdd,
     generation_mw, supply_demand_gap, gas_pct, renewable_pct, interchange_mw,
+    gas_price, gas_price_change_7d, nuclear_outage_pct,
     sentiment_mean_24h, sentiment_min_24h, event_count_24h, geo_risk_index,
     is_spike, spike_magnitude
 FROM featured
