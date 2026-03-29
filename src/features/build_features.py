@@ -3,11 +3,10 @@ SENTINEL — Gold Layer Feature Engineering
 Joins Silver (clean.demand, clean.fuel_mix) + Weather + GDELT → analytics.features.
 
 Strategy:
-  - Pure SQL with window functions for lag/rolling features (runs inside DB, no pandas)
-  - GDELT is daily → broadcast to all hours of that day via DATE() join
-  - Weather is hourly × per-BA → direct join on (period, ba_code)
-  - Processes one month at a time to manage transaction size
-  - Idempotent via ON CONFLICT DO NOTHING
+  - Pure SQL with window functions for lag/rolling features (runs inside DB)
+  - Modifies CTEs to allow 7-day lookback so window functions don't truncate early in month
+  - Updates holiday flags post-insert using pandas USFederalHolidayCalendar
+  - Idempotent via ON CONFLICT DO UPDATE
 
 Run: python -m src.features.build_features
 """
@@ -15,12 +14,17 @@ Run: python -m src.features.build_features
 from sqlalchemy import text
 from loguru import logger
 from datetime import datetime
+import pandas as pd
+from pandas.tseries.holiday import USFederalHolidayCalendar
 
 from src.database.connection import get_engine
 
+# The 12 BAs with full feature coverage (GKG sentiment mapping)
+TARGET_BAS = [
+    'ERCO', 'NYIS', 'ISNE', 'FPL', 'CISO', 'PJM',
+    'MISO', 'SWPP', 'SOCO', 'TVA', 'DUK', 'BPAT'
+]
 
-# ── The core feature query ───────────────────────────────────────────
-# Uses CTEs: 1) base join  2) window functions  3) final insert
 FEATURE_SQL = """
 WITH base AS (
     SELECT
@@ -44,6 +48,14 @@ WITH base AS (
         COALESCE(fm.gas_pct, 0)                     AS gas_pct,
         COALESCE(fm.renewable_pct, 0)               AS renewable_pct,
 
+        -- NEW: supply_margin_pct
+        (d.generation_mw - d.demand_mw) / NULLIF(d.demand_mw, 0) AS supply_margin_pct,
+
+        -- Commodity & Generation Signals (daily -> broadcast)
+        gp.value                                    AS gas_price,
+        op.value                                    AS oil_price,
+        no.pct_outage                               AS nuclear_outage_pct,
+
         -- Weather features
         w.temperature_2m                            AS temperature_c,
         w.relative_humidity_2m                      AS humidity_pct,
@@ -53,61 +65,61 @@ WITH base AS (
         GREATEST(18.0 - COALESCE(w.temperature_2m, 18), 0) AS hdd,
         GREATEST(COALESCE(w.temperature_2m, 18) - 18.0, 0) AS cdd,
 
-        -- GDELT NLP/geopolitical signals (daily → broadcast to hours)
+        -- GDELT NLP/geopolitical signals
         COALESCE(g.us_avg_goldstein, 0)             AS sentiment_mean_24h,
         COALESCE(g.us_min_goldstein, 0)             AS sentiment_min_24h,
         COALESCE(g.us_event_count, 0)               AS event_count_24h,
-        -- Geo risk index: scaled severe conflict + oil tension
         COALESCE(
             (g.us_severe_conflict::DOUBLE PRECISION / NULLIF(g.us_event_count, 0)) * 10
             + (g.oil_region_event_count::DOUBLE PRECISION / NULLIF(g.global_event_count, 0)) * 10,
             0
-        )                                           AS geo_risk_index,
-
-        -- Price features (daily → broadcast to hours)
-        gp.value                                    AS gas_price,
-
-        -- Nuclear outage features (daily → broadcast to hours)
-        no.pct_outage                               AS nuclear_outage_pct
+        )                                           AS geo_risk_index
 
     FROM clean.demand d
 
-    -- Fuel mix: same (period, ba_code) grain
     LEFT JOIN clean.fuel_mix fm
         ON fm.period = d.period AND fm.ba_code = d.ba_code
 
-    -- Weather: same (period, ba_code) grain
     LEFT JOIN raw.weather_hourly w
         ON w.period = d.period AND w.ba_code = d.ba_code
 
-    -- GDELT: daily → join on date portion
     LEFT JOIN raw.gdelt_events_daily g
         ON g.event_date = d.period::DATE
 
-    -- Gas prices: daily Henry Hub spot → join on date
     LEFT JOIN raw.eia_gas_prices gp
-        ON gp.period = d.period::DATE
-       AND gp.series_name = 'Henry Hub Natural Gas Spot Price (Dollars per Million Btu)'
-
-    -- Nuclear outages: daily national → join on date
+        ON gp.period::DATE = d.period::DATE AND gp.process_name = 'Spot Price'
+    LEFT JOIN raw.eia_oil_prices op
+        ON op.period::DATE = d.period::DATE
     LEFT JOIN raw.eia_nuclear_outages no
-        ON no.period = d.period::DATE
+        ON no.period::DATE = d.period::DATE
 
-    WHERE d.period >= :start_ts
+    WHERE d.period >= :start_ts_lag -- Include 7 days before target start for window funcs
       AND d.period <  :end_ts
+      AND d.ba_code IN ('ERCO','NYIS','ISNE','FPL','CISO','PJM','MISO','SWPP','SOCO','TVA','DUK','BPAT')
 ),
 
--- Add lag / rolling features via window functions
 featured AS (
     SELECT
         b.*,
 
-        -- Demand lags
+        -- NEW: gas_pct_delta_24h
+        b.gas_pct - LAG(b.gas_pct, 24) OVER w AS gas_pct_delta_24h,
+
+        -- Price change & volatility
+        (b.gas_price - LAG(b.gas_price, 168) OVER w) 
+            / NULLIF(LAG(b.gas_price, 168) OVER w, 0) AS gas_price_change_7d,
+            
+        -- NEW: gas_price_volatility_7d
+        STDDEV(b.gas_price) OVER (
+            PARTITION BY b.ba_code ORDER BY b.period
+            ROWS BETWEEN 167 PRECEDING AND CURRENT ROW
+        ) AS gas_price_volatility_7d,
+
+        -- Demand lags & rolls
         LAG(b.demand_mw, 1) OVER w       AS demand_lag_1h,
         LAG(b.demand_mw, 24) OVER w      AS demand_lag_24h,
         LAG(b.demand_mw, 168) OVER w     AS demand_lag_168h,
 
-        -- Rolling stats
         AVG(b.demand_mw) OVER (
             PARTITION BY b.ba_code ORDER BY b.period
             ROWS BETWEEN 23 PRECEDING AND CURRENT ROW
@@ -121,13 +133,7 @@ featured AS (
             ROWS BETWEEN 23 PRECEDING AND CURRENT ROW
         )                                  AS demand_std_24h,
 
-        -- Gas price 7-day % change (daily, broadcast across hours)
-        CASE WHEN LAG(b.gas_price, 168) OVER w > 0 THEN
-            (b.gas_price - LAG(b.gas_price, 168) OVER w)
-            / LAG(b.gas_price, 168) OVER w * 100.0
-        ELSE NULL END                      AS gas_price_change_7d,
-
-        -- Spike detection (demand deviates >2σ from 24h rolling mean)
+        -- Spike detection
         CASE WHEN ABS(b.demand_mw - AVG(b.demand_mw) OVER (
             PARTITION BY b.ba_code ORDER BY b.period
             ROWS BETWEEN 23 PRECEDING AND CURRENT ROW
@@ -157,9 +163,10 @@ INSERT INTO analytics.features (
     temperature_c, humidity_pct, wind_speed_kmh, cloud_cover_pct,
     solar_radiation, hdd, cdd,
     generation_mw, supply_demand_gap, gas_pct, renewable_pct, interchange_mw,
-    gas_price, gas_price_change_7d, nuclear_outage_pct,
+    gas_price, oil_price, gas_price_change_7d, nuclear_outage_pct,
     sentiment_mean_24h, sentiment_min_24h, event_count_24h, geo_risk_index,
-    is_spike, spike_magnitude
+    is_spike, spike_magnitude,
+    supply_margin_pct, gas_pct_delta_24h, gas_price_volatility_7d
 )
 SELECT
     period, ba_code,
@@ -170,23 +177,47 @@ SELECT
     temperature_c, humidity_pct, wind_speed_kmh, cloud_cover_pct,
     solar_radiation, hdd, cdd,
     generation_mw, supply_demand_gap, gas_pct, renewable_pct, interchange_mw,
-    gas_price, gas_price_change_7d, nuclear_outage_pct,
+    gas_price, oil_price, gas_price_change_7d, nuclear_outage_pct,
     sentiment_mean_24h, sentiment_min_24h, event_count_24h, geo_risk_index,
-    is_spike, spike_magnitude
+    is_spike, spike_magnitude,
+    supply_margin_pct, gas_pct_delta_24h, gas_price_volatility_7d
 FROM featured
-ON CONFLICT (period, ba_code) DO NOTHING;
+WHERE period >= :start_ts -- Filter down to exactly the target month
+ON CONFLICT (period, ba_code) DO UPDATE SET
+    gas_price = EXCLUDED.gas_price,
+    oil_price = EXCLUDED.oil_price,
+    gas_price_change_7d = EXCLUDED.gas_price_change_7d,
+    nuclear_outage_pct = EXCLUDED.nuclear_outage_pct,
+    supply_margin_pct = EXCLUDED.supply_margin_pct,
+    gas_pct_delta_24h = EXCLUDED.gas_pct_delta_24h,
+    gas_price_volatility_7d = EXCLUDED.gas_price_volatility_7d,
+    demand_lag_168h = EXCLUDED.demand_lag_168h,
+    demand_rolling_168h = EXCLUDED.demand_rolling_168h;
 """
 
+def apply_holidays(engine, min_date, max_date):
+    logger.info("Applying US Federal Holidays...")
+    cal = USFederalHolidayCalendar()
+    holidays = cal.holidays(start=min_date, end=max_date).to_pydatetime()
+    holiday_dates = [h.strftime('%Y-%m-%d') for h in holidays]
+    
+    # Build a VALUES list for the IN clause (psycopg2 doesn't support ANY with :param)
+    date_literals = ",".join([f"'{d}'" for d in holiday_dates])
+    
+    with engine.begin() as conn:
+        conn.execute(text(f"""
+            UPDATE analytics.features 
+            SET is_holiday = TRUE 
+            WHERE period::DATE IN ({date_literals})
+        """))
+    
+    logger.info(f"Marked {len(holiday_dates)} holidays between {min_date} and {max_date}")
 
 def build_features():
-    """Build the Gold analytics.features table month by month."""
     engine = get_engine()
 
-    # Determine date range from clean.demand
     with engine.connect() as conn:
-        result = conn.execute(text(
-            "SELECT MIN(period), MAX(period) FROM clean.demand"
-        )).fetchone()
+        result = conn.execute(text("SELECT MIN(period), MAX(period) FROM clean.demand")).fetchone()
         min_date, max_date = result[0], result[1]
 
     if not min_date or not max_date:
@@ -195,7 +226,6 @@ def build_features():
 
     logger.info(f"Building features from {min_date} to {max_date}")
 
-    # Process month by month to manage memory and transaction size
     from datetime import timedelta
     import calendar
 
@@ -203,55 +233,40 @@ def build_features():
     total_inserted = 0
 
     while current <= max_date:
-        # Calculate month end
         _, last_day = calendar.monthrange(current.year, current.month)
         month_end = current.replace(day=last_day, hour=23, minute=59, second=59)
         next_month = (current.replace(day=28) + timedelta(days=4)).replace(
             day=1, hour=0, minute=0, second=0, microsecond=0
         )
+        
+        # We need data from 7 days prior to satisfy the 168h window functions
+        start_ts_lag = current - timedelta(days=7)
 
         logger.info(f"  Processing {current.strftime('%Y-%m')}...")
 
         with engine.begin() as conn:
             conn.execute(
                 text(FEATURE_SQL),
-                {"start_ts": current, "end_ts": next_month}
+                {"start_ts": current, "end_ts": next_month, "start_ts_lag": start_ts_lag}
             )
 
         current = next_month
         total_inserted += 1
 
-    # ── Verification ─────────────────────────────────────────────────
-    with engine.connect() as conn:
-        count = conn.execute(
-            text("SELECT COUNT(*) FROM analytics.features")
-        ).scalar()
-        ba_count = conn.execute(
-            text("SELECT COUNT(DISTINCT ba_code) FROM analytics.features")
-        ).scalar()
-        date_range = conn.execute(
-            text("SELECT MIN(period), MAX(period) FROM analytics.features")
-        ).fetchone()
-        null_pcts = conn.execute(text("""
-            SELECT
-                ROUND(100.0 * SUM(CASE WHEN demand_mw IS NULL THEN 1 ELSE 0 END) / COUNT(*), 2) AS demand_null_pct,
-                ROUND(100.0 * SUM(CASE WHEN temperature_c IS NULL THEN 1 ELSE 0 END) / COUNT(*), 2) AS weather_null_pct,
-                ROUND(100.0 * SUM(CASE WHEN geo_risk_index IS NULL OR geo_risk_index = 0 THEN 1 ELSE 0 END) / COUNT(*), 2) AS gdelt_null_pct,
-                ROUND(100.0 * SUM(CASE WHEN is_spike THEN 1 ELSE 0 END) / COUNT(*), 2) AS spike_pct
-            FROM analytics.features
-        """)).fetchone()
+    # Post processing: Apply Holidays
+    apply_holidays(engine, min_date, max_date)
 
+    with engine.connect() as conn:
+        count = conn.execute(text("SELECT COUNT(*) FROM analytics.features")).scalar()
+        ba_count = conn.execute(text("SELECT COUNT(DISTINCT ba_code) FROM analytics.features")).scalar()
+        holiday_count = conn.execute(text("SELECT COUNT(*) FROM analytics.features WHERE is_holiday = TRUE")).scalar()
+        
         logger.info("=" * 60)
         logger.info("✅ Gold Layer Complete!")
         logger.info(f"  Total rows:      {count:,}")
         logger.info(f"  BAs:             {ba_count}")
-        logger.info(f"  Date range:      {date_range[0]} → {date_range[1]}")
-        logger.info(f"  demand NULL%:    {null_pcts[0]}%")
-        logger.info(f"  weather NULL%:   {null_pcts[1]}%")
-        logger.info(f"  gdelt zero/NULL%:{null_pcts[2]}%")
-        logger.info(f"  spike%:          {null_pcts[3]}%")
+        logger.info(f"  Holiday rows:    {holiday_count:,}")
         logger.info("=" * 60)
-
 
 if __name__ == "__main__":
     build_features()

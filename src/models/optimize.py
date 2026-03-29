@@ -1,6 +1,6 @@
 """
 SENTINEL — Optuna Hyperparameter Optimization for TFT
-Walk-forward cross-validation with expanding windows.
+Fast tuning mode (Model C): Single split, 3 representative BAs, max 10 epochs with pruning.
 
 Usage:
     python -m src.models.optimize              # Run optimization
@@ -12,44 +12,33 @@ import warnings
 from copy import deepcopy
 
 import optuna
+from optuna.integration import PyTorchLightningPruningCallback
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import EarlyStopping
-from pytorch_forecasting import TemporalFusionTransformer
 from pytorch_forecasting.metrics import QuantileLoss
 from loguru import logger
 
 from src.models.config import (
     DEFAULT_TFT_CONFIG, DEFAULT_OPTUNA_CONFIG, RESULTS_DIR,
-    TIME_VARYING_OBSERVED_REALS_MODEL_B,
+    TrainSplitConfig
 )
 from src.models.dataset import load_features_df, prepare_dataframe, build_datasets
-from src.models.config import TrainSplitConfig
+from src.models.train_tft import SentinelTFT
 
 warnings.filterwarnings("ignore", ".*does not have many workers.*")
 
 
-# Walk-forward CV folds (expanding window)
-CV_FOLDS = [
-    TrainSplitConfig(
-        train_start="2021-01-01", train_end="2023-01-01",
-        val_start="2023-01-01", val_end="2023-07-01",
-        test_start="2023-07-01", test_end="2024-01-01",
-    ),
-    TrainSplitConfig(
-        train_start="2021-01-01", train_end="2023-07-01",
-        val_start="2023-07-01", val_end="2024-01-01",
-        test_start="2024-01-01", test_end="2024-07-01",
-    ),
-    TrainSplitConfig(
-        train_start="2021-01-01", train_end="2024-07-01",
-        val_start="2024-07-01", val_end="2025-01-01",
-        test_start="2025-01-01", test_end="2025-07-01",
-    ),
-]
+# Fast tuning configuration
+TUNING_SPLIT = TrainSplitConfig(
+    train_start="2021-01-01", train_end="2024-07-01",
+    val_start="2024-07-01", val_end="2025-01-01",
+    test_start="2025-01-01", test_end="2025-07-01",
+)
+TUNING_BAS = ['ERCO', 'PJM', 'CISO']
 
 
 def objective(trial: optuna.Trial, df, optuna_cfg) -> float:
-    """Optuna objective: average val_loss across walk-forward CV folds."""
+    """Optuna objective: val_loss on a single split, pruned early."""
 
     # Sample hyperparameters
     config = deepcopy(DEFAULT_TFT_CONFIG)
@@ -77,61 +66,67 @@ def objective(trial: optuna.Trial, df, optuna_cfg) -> float:
                 f"lr={config.learning_rate:.1e}, batch={config.batch_size}, "
                 f"lstm={config.lstm_layers}")
 
-    fold_losses = []
+    try:
+        # Filter to 3 representative BAs for speed
+        df_tune = df[df["ba_code"].isin(TUNING_BAS)].copy()
 
-    for fold_idx, fold_split in enumerate(CV_FOLDS):
-        try:
-            training, validation, _ = build_datasets(
-                df, model_variant="B", config=config, split=fold_split
-            )
+        training, validation, _ = build_datasets(
+            df_tune, model_variant="C", config=config, split=TUNING_SPLIT
+        )
 
-            train_loader = training.to_dataloader(
-                train=True, batch_size=config.batch_size,
-                num_workers=config.num_workers,
-            )
-            val_loader = validation.to_dataloader(
-                train=False, batch_size=config.batch_size * 2,
-                num_workers=config.num_workers,
-            )
+        train_loader = training.to_dataloader(
+            train=True, batch_size=config.batch_size,
+            num_workers=config.num_workers,
+            pin_memory=config.pin_memory,
+            prefetch_factor=config.prefetch_factor if config.num_workers > 0 else None,
+        )
+        val_loader = validation.to_dataloader(
+            train=False, batch_size=config.batch_size * 2,
+            num_workers=config.num_workers,
+            pin_memory=config.pin_memory,
+            prefetch_factor=config.prefetch_factor if config.num_workers > 0 else None,
+        )
 
-            tft = TemporalFusionTransformer.from_dataset(
-                training,
-                learning_rate=config.learning_rate,
-                hidden_size=config.hidden_size,
-                attention_head_size=config.attention_head_size,
-                dropout=config.dropout,
-                hidden_continuous_size=config.hidden_continuous_size,
-                lstm_layers=config.lstm_layers,
-                loss=QuantileLoss(quantiles=config.quantiles),
-                optimizer="ranger",
-                reduce_on_plateau_patience=config.reduce_lr_patience,
-            )
+        tft = SentinelTFT.from_dataset(
+            training,
+            learning_rate=config.learning_rate,
+            hidden_size=config.hidden_size,
+            attention_head_size=config.attention_head_size,
+            dropout=config.dropout,
+            hidden_continuous_size=config.hidden_continuous_size,
+            lstm_layers=config.lstm_layers,
+            loss=QuantileLoss(quantiles=config.quantiles),
+        )
 
-            trainer = pl.Trainer(
-                max_epochs=20,  # Cap per fold for speed
-                accelerator=config.accelerator,
-                devices=config.devices,
-                precision=config.precision,
-                gradient_clip_val=config.gradient_clip_val,
-                callbacks=[EarlyStopping(monitor="val_loss", patience=3, mode="min")],
-                enable_progress_bar=False,
-                enable_model_summary=False,
-                logger=False,
-            )
+        callbacks = [
+            EarlyStopping(monitor="val_loss", patience=3, mode="min"),
+            PyTorchLightningPruningCallback(trial, monitor="val_loss"),
+        ]
 
-            trainer.fit(tft, train_dataloaders=train_loader, val_dataloaders=val_loader)
-            val_loss = trainer.callback_metrics["val_loss"].item()
-            fold_losses.append(val_loss)
+        trainer = pl.Trainer(
+            max_epochs=10,  # Cap at 10 epochs for faster tuning
+            accelerator=config.accelerator,
+            devices=config.devices,
+            precision=config.precision,
+            gradient_clip_val=config.gradient_clip_val,
+            callbacks=callbacks,
+            enable_progress_bar=False,
+            enable_model_summary=False,
+            logger=False,
+        )
 
-            logger.info(f"  Fold {fold_idx + 1}/3: val_loss = {val_loss:.4f}")
+        trainer.fit(tft, train_dataloaders=train_loader, val_dataloaders=val_loader)
+        val_loss = trainer.callback_metrics["val_loss"].item()
 
-        except Exception as e:
-            logger.warning(f"  Fold {fold_idx + 1} failed: {e}")
-            return float("inf")
+        logger.info(f"Trial {trial.number} completed. val_loss = {val_loss:.4f}")
+        return val_loss
 
-    avg_loss = sum(fold_losses) / len(fold_losses)
-    logger.info(f"Trial {trial.number} avg val_loss: {avg_loss:.4f}")
-    return avg_loss
+    except optuna.exceptions.TrialPruned:
+        logger.info(f"Trial {trial.number} PRUNED (unpromising val_loss)")
+        raise
+    except Exception as e:
+        logger.warning(f"Trial {trial.number} failed: {e}")
+        return float("inf")
 
 
 def run_optimization(n_trials: int = None):
@@ -141,20 +136,22 @@ def run_optimization(n_trials: int = None):
         optuna_cfg.n_trials = n_trials
 
     logger.info(f"{'='*60}")
-    logger.info(f"SENTINEL — Optuna Hyperparameter Search")
+    logger.info(f"SENTINEL — Optuna Hyperparameter Search (FAST MODE)")
     logger.info(f"  Trials: {optuna_cfg.n_trials}")
-    logger.info(f"  CV Folds: {len(CV_FOLDS)} (expanding window)")
+    logger.info(f"  Target BAs: {TUNING_BAS}")
+    logger.info(f"  Pruning: Enabled")
     logger.info(f"{'='*60}")
 
     # Load data once
     df = load_features_df()
-    df = prepare_dataframe(df)
+    df = prepare_dataframe(df, model_variant="C")
 
     study = optuna.create_study(
         study_name=optuna_cfg.study_name,
         storage=optuna_cfg.storage,
         direction="minimize",
         load_if_exists=True,
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=2),
     )
 
     study.optimize(
