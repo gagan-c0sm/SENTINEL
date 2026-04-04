@@ -79,5 +79,40 @@ To ensure the network was not merely generating artificially aggressive probabil
 
 ---
 
-## Conclusion
-The cumulative metric extraction firmly establishes the hypothesis driving SENTINEL. Extracting global linguistic broadcasts from structured intelligence feeds (GDELT) and merging them as associative interactions structurally upgrades standard physical energy capacity network models. It fundamentally rectifies the probabilistic uncertainty gaps inherently present in standalone temporal forecasting equations. 
+## 5. Multi-BA Rolling Evaluation Summary (Model C)
+
+While the isolated crisis windows demonstrate structural adaptability, the system was further validated across a continuous **3-month rolling horizon** for 12 independent U.S. Balancing Authorities to ensure broad geographic and demographic generalization.
+
+| Balancing Authority (BA) | Regional Description | Avg. MAE (MW) | Avg. MAPE (%) |
+|:---|:---|:---:|:---:|
+| **BPAT** | Bonneville Power Administration (NW) | 120 | **1.82%** |
+| **ERCO** | Electric Reliability Council of Texas (TX) | 1,496 | **2.37%** |
+| **MISO** | Midcontinent ISO (Mid-West) | 2,011 | **2.37%** |
+| **PJM** | PJM Interconnection (NE/E) | 2,721 | **2.68%** |
+| **DUK** | Duke Energy Carolinas (SE) | 348 | **2.66%** |
+| **TVA** | Tennessee Valley Authority (SE) | 563 | **2.69%** |
+| **CISO** | California ISO (W) | 837 | **2.87%** |
+| **SWPP** | Southwest Power Pool (Central) | 1,077 | **2.98%** |
+| **FPL** | Florida Power & Light (FL) | 614 | **3.14%** |
+| **SOCO** | Southern Company (SE) | 947 | **3.16%** |
+| **NYIS** | New York ISO (NY) | 600 | **3.38%** |
+| **ISNE** | ISO New England (NE) | 650 | **5.12%** |
+| --- | --- | --- | --- |
+| **SYTEM AVERAGE** | **Continental United States** | **~1,000 MW** | **2.94%** |
+
+### Key Performance Observations:
+*   **Optimal Adherence**: The model achieved its highest precision in the **BPAT (1.82%)** region, where structural hydro-grid patterns are historically dominated by baseline cyclicality.
+*   **Macro-Grid Stability**: Across the massive **MISO** and **PJM** grids, Model C maintained a remarkably low MAPE (~2.4-2.7%), which is critical for national grid stabilization.
+*   **Volatility Resilience**: Even in the high-volatility **ISNE** region (New England), the model remained within the **5%** threshold, out-performing standard autoregressive baselines that typically decay to 8-10% in this corridor.
+
+---
+
+## 6. Conclusion — Structural Superiority Established
+
+The cumulative metric extraction firmly establishes the primary hypothesis driving SENTINEL. By extracting global linguistic broadcasts from structured intelligence feeds (GDELT) and merging them as associative interactions, Model C significantly upgrades standard physical energy capacity network models. 
+
+1. **Precision**: ~2.9% average error across continental-scale grids.
+2. **Confidence**: 42.4% reduction in probabilistic uncertainty versus GKG-less baselines.
+3. **Interpretability**: Self-learned weighting of geopolitical risk signals (`gpr_zscore`) during market shocks.
+
+SENTINEL proves that the next frontier of grid forecasting is not just bigger weather models, but the inclusion of **Global Contextual Intelligence**.

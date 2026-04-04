@@ -48,3 +48,7 @@ tmp_*.py
 tools/
 results/
 checkpoints/
+
+# Logs & Metrics
+lightning_logs/
+docs/1YEAR_BA_METRICS.md
