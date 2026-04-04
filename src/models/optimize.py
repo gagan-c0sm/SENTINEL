@@ -12,11 +12,15 @@ import warnings
 from copy import deepcopy
 
 import optuna
+import numpy as np
+import torch
 from optuna.integration import PyTorchLightningPruningCallback
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import EarlyStopping
 from pytorch_forecasting.metrics import QuantileLoss
 from loguru import logger
+
+from src.models.crisis_loss import CrisisAwareQuantileLoss
 
 from src.models.config import (
     DEFAULT_TFT_CONFIG, DEFAULT_OPTUNA_CONFIG, RESULTS_DIR,
@@ -34,7 +38,11 @@ TUNING_SPLIT = TrainSplitConfig(
     val_start="2024-07-01", val_end="2025-01-01",
     test_start="2025-01-01", test_end="2025-07-01",
 )
-TUNING_BAS = ['ERCO', 'PJM', 'CISO']
+# Use all BAs for tuning to ensure fairness penalty works correctly
+TUNING_BAS = [
+    'BPAT', 'CISO', 'DUK', 'ERCO', 'FPL', 'ISNE', 
+    'MISO', 'NYIS', 'PJM', 'SOCO', 'SWPP', 'TVA'
+]
 
 
 def objective(trial: optuna.Trial, df, optuna_cfg) -> float:
@@ -66,9 +74,22 @@ def objective(trial: optuna.Trial, df, optuna_cfg) -> float:
                 f"lr={config.learning_rate:.1e}, batch={config.batch_size}, "
                 f"lstm={config.lstm_layers}")
 
+    # Sample crisis-aware loss parameters
+    outer_weight = trial.suggest_float(
+        "outer_weight", *optuna_cfg.outer_weight_range
+    )
+    crisis_scale = trial.suggest_float(
+        "crisis_scale", *optuna_cfg.crisis_scale_range
+    )
+    logger.info(f"  Crisis params: outer_weight={outer_weight:.2f}, crisis_scale={crisis_scale:.2f}")
+
     try:
         # Filter to 3 representative BAs for speed
         df_tune = df[df["ba_code"].isin(TUNING_BAS)].copy()
+
+        # Re-prepare with trial-specific crisis_scale
+        from src.models.dataset import prepare_dataframe as prep_df
+        df_tune = prep_df(df_tune, model_variant="C", crisis_scale=crisis_scale)
 
         training, validation, _ = build_datasets(
             df_tune, model_variant="C", config=config, split=TUNING_SPLIT
@@ -95,7 +116,11 @@ def objective(trial: optuna.Trial, df, optuna_cfg) -> float:
             dropout=config.dropout,
             hidden_continuous_size=config.hidden_continuous_size,
             lstm_layers=config.lstm_layers,
-            loss=QuantileLoss(quantiles=config.quantiles),
+            loss=CrisisAwareQuantileLoss(
+                quantiles=config.quantiles,
+                outer_weight=outer_weight,
+                crisis_boost=5.0,
+            ),
         )
 
         callbacks = [
@@ -118,6 +143,27 @@ def objective(trial: optuna.Trial, df, optuna_cfg) -> float:
         trainer.fit(tft, train_dataloaders=train_loader, val_dataloaders=val_loader)
         val_loss = trainer.callback_metrics["val_loss"].item()
 
+        # Add Per-BA Fairness Penalty
+        try:
+            val_out = tft.predict(val_loader, mode="quantiles", return_x=False, trainer_kwargs=dict(accelerator="cpu"))
+            actuals = torch.cat([y[0] for _, y in iter(val_loader)]).cpu().numpy()
+            q50 = val_out[:, :, 3].cpu().numpy()
+            
+            # Compute MAPE per BA
+            mapes = []
+            for i in range(len(actuals)):
+                valid = actuals[i] > 100
+                if valid.any():
+                    mape = np.mean(np.abs(actuals[i][valid] - q50[i][valid]) / actuals[i][valid])
+                    mapes.append(mape)
+            
+            if len(mapes) > 1:
+                cv = np.std(mapes) / max(np.mean(mapes), 1e-6)
+                val_loss = val_loss * (1.0 + 0.5 * cv)
+                logger.debug(f"  Penalty applied: base_loss={val_loss/(1.0+0.5*cv):.4f}, CV={cv:.4f}, new_loss={val_loss:.4f}")
+        except Exception as e:
+            logger.warning(f"  Could not compute fairness penalty: {e}")
+
         logger.info(f"Trial {trial.number} completed. val_loss = {val_loss:.4f}")
         return val_loss
 
@@ -138,13 +184,14 @@ def run_optimization(n_trials: int = None):
     logger.info(f"{'='*60}")
     logger.info(f"SENTINEL — Optuna Hyperparameter Search (FAST MODE)")
     logger.info(f"  Trials: {optuna_cfg.n_trials}")
+    logger.info(f"  Timeout: {optuna_cfg.timeout // 3600}h hard cap")
     logger.info(f"  Target BAs: {TUNING_BAS}")
-    logger.info(f"  Pruning: Enabled")
+    logger.info(f"  Search: architecture + crisis loss params (8 dimensions)")
+    logger.info(f"  Pruning: MedianPruner (kill bad trials by epoch 3)")
     logger.info(f"{'='*60}")
 
-    # Load data once
-    df = load_features_df()
-    df = prepare_dataframe(df, model_variant="C")
+    # Load raw data once (preparation happens per-trial with trial-specific crisis_scale)
+    df_raw = load_features_df()
 
     study = optuna.create_study(
         study_name=optuna_cfg.study_name,
@@ -155,7 +202,7 @@ def run_optimization(n_trials: int = None):
     )
 
     study.optimize(
-        lambda trial: objective(trial, df, optuna_cfg),
+        lambda trial: objective(trial, df_raw, optuna_cfg),
         n_trials=optuna_cfg.n_trials,
         timeout=optuna_cfg.timeout,
         show_progress_bar=True,

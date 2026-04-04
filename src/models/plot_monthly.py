@@ -37,6 +37,12 @@ CRISIS_WINDOWS = {
         "end": "2026-03-22",
         "escalation": "2026-02-28",  # Geo risk spike date
     },
+    "tva_2025": {
+        "label": "Shoulder Season Heatwave — TVA 2025",
+        "start": "2025-05-14",
+        "end": "2025-05-18",
+        "escalation": "2025-05-16",  # Peak GKG stress date
+    },
 }
 
 # Dark theme
@@ -103,40 +109,40 @@ def plot_gdelt_timeline(df, crisis, save_dir):
     crisis_df["date"] = crisis_df["period"].dt.date
 
     daily = crisis_df.groupby("date").agg({
-        "sentiment_mean_24h": "mean",
-        "geo_risk_index": "mean",
-        "event_count_24h": "mean",
+        "energy_tone_regional": "mean",
+        "grid_stress_zscore": "mean",
+        "electricity_buzz_zscore": "mean",
     }).reset_index()
     daily["date"] = pd.to_datetime(daily["date"])
 
     fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
 
-    # Geo Risk Index
+    # Grid Stress Index
     ax = axes[0]
-    ax.fill_between(daily["date"], daily["geo_risk_index"], alpha=0.4, color="#f85149")
-    ax.plot(daily["date"], daily["geo_risk_index"], color="#f85149", linewidth=2)
-    ax.set_ylabel("Geo Risk Index")
-    ax.set_title("GDELT Geopolitical Risk Index", fontweight="bold")
+    ax.fill_between(daily["date"], daily["grid_stress_zscore"], alpha=0.4, color="#f85149")
+    ax.plot(daily["date"], daily["grid_stress_zscore"], color="#f85149", linewidth=2)
+    ax.set_ylabel("Grid Stress (Z)")
+    ax.set_title("SENTINEL Systemic Grid Stress Index", fontweight="bold")
     ax.axvline(pd.Timestamp(crisis["escalation"]), color="#ffa657",
-               linestyle="--", alpha=0.8, label="Escalation Date")
+               linestyle="--", alpha=0.8, label="Peak Anomaly Date")
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
 
     # Sentiment
     ax = axes[1]
-    ax.fill_between(daily["date"], daily["sentiment_mean_24h"], alpha=0.4, color="#58a6ff")
-    ax.plot(daily["date"], daily["sentiment_mean_24h"], color="#58a6ff", linewidth=2)
-    ax.set_ylabel("Avg Sentiment (Goldstein)")
-    ax.set_title("GDELT Sentiment (More Negative = Worse)", fontweight="bold")
+    ax.fill_between(daily["date"], daily["energy_tone_regional"], alpha=0.4, color="#58a6ff")
+    ax.plot(daily["date"], daily["energy_tone_regional"], color="#58a6ff", linewidth=2)
+    ax.set_ylabel("Avg Sentiment (Tone)")
+    ax.set_title("Regional Energy Sentiment (GDELT Tone)", fontweight="bold")
     ax.axvline(pd.Timestamp(crisis["escalation"]), color="#ffa657",
                linestyle="--", alpha=0.8)
     ax.grid(True, alpha=0.3)
 
-    # Event Count
+    # Event Buzz
     ax = axes[2]
-    ax.bar(daily["date"], daily["event_count_24h"], color="#3fb950", alpha=0.6, width=0.8)
-    ax.set_ylabel("Event Count (24h)")
-    ax.set_title("GDELT Event Volume", fontweight="bold")
+    ax.bar(daily["date"], daily["electricity_buzz_zscore"], color="#3fb950", alpha=0.6, width=0.8)
+    ax.set_ylabel("Event Buzz (Z)")
+    ax.set_title("Geopolitical Event Volume (Electricity Buzz)", fontweight="bold")
     ax.axvline(pd.Timestamp(crisis["escalation"]), color="#ffa657",
                linestyle="--", alpha=0.8)
     ax.grid(True, alpha=0.3)
@@ -252,8 +258,8 @@ def plot_vsn_importance(tft, df, training, config, crisis, save_dir):
     This bypasses the broken interpret_output() by manually extracting
     attention weights from the TFT's internal layers.
     """
-    # Use ERCO as representative BA
-    ba = "ERCO"
+    # Use TVA as representative BA
+    ba = "TVA"
     encoder_start = pd.Timestamp(crisis["end"]) - pd.Timedelta(
         hours=config.encoder_length + config.prediction_length + 24
     )
@@ -427,7 +433,7 @@ def main():
     parser = argparse.ArgumentParser(description="SENTINEL Monthly Crisis Plots")
     parser.add_argument("--crisis", type=str, default="iran_2026",
                         choices=list(CRISIS_WINDOWS.keys()))
-    parser.add_argument("--model", type=str, default="A", choices=["A", "B"],
+    parser.add_argument("--model", type=str, default="A", choices=["A", "B", "C"],
                         help="Model variant to evaluate (A=Baseline, B=SENTINEL)")
     args = parser.parse_args()
 
@@ -514,8 +520,8 @@ def plot_multi_ba_predictions_variant(tft, df, training, config, crisis, save_di
 
 def plot_vsn_importance_variant(tft, df, training, config, crisis, save_dir, variant):
     """Modified VSN plot to include variant in title/filename."""
-    # Use ERCO as representative BA
-    ba = "ERCO"
+    # Use TVA as representative BA
+    ba = "TVA"
     encoder_start = pd.Timestamp(crisis["end"]) - pd.Timedelta(
         hours=config.encoder_length + config.prediction_length + 24
     )

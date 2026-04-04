@@ -10,7 +10,7 @@ import numpy as np
 from loguru import logger
 from pytorch_forecasting import TimeSeriesDataSet
 from pytorch_forecasting.data import NaNLabelEncoder
-from pytorch_forecasting.data.encoders import GroupNormalizer
+from pytorch_forecasting.data.encoders import GroupNormalizer, EncoderNormalizer
 
 from src.database.connection import get_engine
 from src.models.config import (
@@ -39,7 +39,7 @@ def load_features_df() -> pd.DataFrame:
     return df
 
 
-def prepare_dataframe(df: pd.DataFrame, model_variant: str = "C") -> pd.DataFrame:
+def prepare_dataframe(df: pd.DataFrame, model_variant: str = "C", crisis_scale: float = 2.0) -> pd.DataFrame:
     """
     Prepare the raw DataFrame for TimeSeriesDataSet:
     - Create monotonic time_idx per BA
@@ -52,12 +52,23 @@ def prepare_dataframe(df: pd.DataFrame, model_variant: str = "C") -> pd.DataFram
     min_period = df["period"].min()
     df["time_idx"] = ((df["period"] - min_period).dt.total_seconds() / 3600).astype(int)
 
+    # Create advanced holiday features
+    # df['is_holiday'] is parsed as numerical binary from DB (0/1 or True/False)
+    # Shift -24 hours means if it is a holiday tomorrow, today is pre_holiday
+    df["is_pre_holiday"] = df.groupby("ba_code")["is_holiday"].shift(-24).fillna(0).astype(int).astype(str)
+    # Shift 24 hours means if it was a holiday yesterday, today is post_holiday
+    df["is_post_holiday"] = df.groupby("ba_code")["is_holiday"].shift(24).fillna(0).astype(int).astype(str)
+
     # Cast booleans to strings for categorical encoding
-    df["is_weekend"] = df["is_weekend"].astype(str)
-    df["is_holiday"] = df["is_holiday"].astype(str)
+    df["is_weekend"] = df["is_weekend"].astype(int).astype(str)
+    df["is_holiday"] = df["is_holiday"].astype(int).astype(str)
 
     # Ensure ba_code is string
     df["ba_code"] = df["ba_code"].astype(str)
+    
+    # ── Data Sanity Fixes ───────────────────────────────────────────
+    if "renewable_pct" in df.columns:
+        df["renewable_pct"] = df["renewable_pct"].clip(lower=0.0, upper=100.0)
 
     # Cast known reals to float
     for col in TIME_VARYING_KNOWN_REALS:
@@ -128,6 +139,31 @@ def prepare_dataframe(df: pd.DataFrame, model_variant: str = "C") -> pd.DataFram
     if len(df) < before:
         logger.warning(f"Dropped {before - len(df)} rows with NaN/zero/negative demand_mw")
 
+    # ── Crisis-Weighted Sampling (Graduated) ────────────────────────
+    # Continuous weighting based on max GKG z-score magnitude.
+    # Avoids binary thresholding that could skew the model:
+    #   z=0   → weight 1.0  (normal, untouched)
+    #   z=1.5 → weight 2.0  (gentle nudge)
+    #   z=3.0 → weight 5.0  (significant)
+    #   z=5+  → weight 9.0  (capped, prevents single-hour dominance)
+    df["weight"] = 1.0
+    gkg_cols_for_weight = ["grid_stress_zscore", "gas_pipeline_zscore",
+                           "electricity_buzz_zscore", "energy_tone_regional"]
+    existing_gkg_cols = [c for c in gkg_cols_for_weight if c in df.columns]
+    if existing_gkg_cols:
+        max_z = df[existing_gkg_cols].abs().max(axis=1)
+        df["weight"] = 1.0 + crisis_scale * np.clip(max_z - 1.0, 0, 4.0)
+        n_elevated = (df["weight"] > 1.5).sum()
+        n_crisis = (df["weight"] > 5.0).sum()
+        logger.info(
+            f"Graduated crisis weighting: "
+            f"{n_elevated:,} hours elevated (>{1.5:.1f}x), "
+            f"{n_crisis:,} hours high-crisis (>{5.0:.1f}x), "
+            f"max weight={df['weight'].max():.1f}x"
+        )
+    else:
+        logger.warning("No GKG columns found — crisis weighting disabled")
+
     # Safety check
     remaining_nans = df.isna().sum().sum()
     if remaining_nans > 0:
@@ -182,18 +218,21 @@ def build_datasets(
         time_varying_known_reals=TIME_VARYING_KNOWN_REALS,
         time_varying_unknown_reals=[TARGET] + observed_reals,
 
-        target_normalizer=GroupNormalizer(
-            groups=GROUP_IDS,
-            transformation="log1p",  # Fix 3: log1p handles heterogeneous BA scales
-            # softplus overflows on large demand values; log1p maps all BAs
-            # to ~7-12 range (log1p(2000)=7.6, log1p(170000)=12.0)
+        target_normalizer=EncoderNormalizer(
+            transformation="log1p",
+            method="robust",
         ),
 
         categorical_encoders={
             "ba_code": NaNLabelEncoder(add_nan=True),
             "is_weekend": NaNLabelEncoder(add_nan=True),
             "is_holiday": NaNLabelEncoder(add_nan=True),
+            "is_pre_holiday": NaNLabelEncoder(add_nan=True),
+            "is_post_holiday": NaNLabelEncoder(add_nan=True),
         },
+
+        # Crisis-weighted sampling: GKG-anomalous hours get 10x loss weight
+        weight="weight",
 
         add_relative_time_idx=True,
         add_target_scales=True,

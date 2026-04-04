@@ -24,6 +24,8 @@ from lightning.pytorch.loggers import TensorBoardLogger
 from pytorch_forecasting import TemporalFusionTransformer
 from pytorch_forecasting.metrics import QuantileLoss
 
+from src.models.crisis_loss import CrisisAwareQuantileLoss
+
 from loguru import logger
 
 from src.models.config import (
@@ -41,19 +43,20 @@ class SentinelTFT(TemporalFusionTransformer):
             lr=self.hparams.learning_rate,
             weight_decay=0.01,
         )
-        # Using estimated_stepping_batches handles gradient accumulation automatically
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
-            max_lr=self.hparams.learning_rate,
-            total_steps=self.trainer.estimated_stepping_batches,
-            pct_start=0.1,       # 10% warmup
-            anneal_strategy='cos',
+            mode="min",
+            factor=0.5,
+            patience=3, # Wait 3 epochs before reducing
+            min_lr=1e-6, # Floor
         )
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "interval": "step",
+                "monitor": "val_loss",
+                "interval": "epoch",
+                "frequency": 1,
             },
         }
 
@@ -121,7 +124,11 @@ def train_tft(
         dropout=config.dropout,
         hidden_continuous_size=config.hidden_continuous_size,
         lstm_layers=config.lstm_layers,
-        loss=QuantileLoss(quantiles=config.quantiles),
+        loss=CrisisAwareQuantileLoss(
+            quantiles=config.quantiles,
+            outer_weight=2.0,   # Q2/Q98 errors penalized 2x (conservative)
+            crisis_boost=5.0,   # Reserved for future dynamic weighting
+        ),
         log_interval=config.tft_log_interval,
         log_val_interval=-1,
     )

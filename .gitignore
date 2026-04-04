@@ -44,3 +44,7 @@ tmp_*.py
 # Research docs (keep these — they're small text files)
 # !*.md
 # !*.html
+
+tools/
+results/
+checkpoints/

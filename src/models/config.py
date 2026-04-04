@@ -36,7 +36,7 @@ TIME_VARYING_KNOWN_REALS = [
     "temperature_c", "hdd", "cdd",                     # Weather (reliable 24h ahead)
     "prophet_trend", "prophet_weekly", "prophet_yearly", # Prophet (deterministic)
 ]
-TIME_VARYING_KNOWN_CATEGORICALS = ["is_weekend", "is_holiday"]
+TIME_VARYING_KNOWN_CATEGORICALS = ["is_weekend", "is_holiday", "is_pre_holiday", "is_post_holiday"]
 
 # Observed features — Model C (Full Pipeline with GKG and GPR)
 TIME_VARYING_OBSERVED_REALS_MODEL_C = [
@@ -105,10 +105,10 @@ class TFTConfig:
     # Training
     learning_rate: float = 1e-3
     batch_size: int = 64
-    max_epochs: int = 30
-    gradient_clip_val: float = 0.1
-    early_stop_patience: int = 5
-    reduce_lr_patience: int = 3
+    max_epochs: int = 50
+    gradient_clip_val: float = 0.01   # Tighter clip for Transformer stability
+    early_stop_patience: int = 8      # Allow 8 plateaus before stopping
+    reduce_lr_patience: int = 3       # Halve LR after 3 plateau epochs
 
     # DataLoader
     num_workers: int = 4
@@ -172,17 +172,21 @@ class TrainSplitConfig:
 @dataclass
 class OptunaConfig:
     """Optuna hyperparameter search."""
-    n_trials: int = 20
-    timeout: Optional[int] = None
+    n_trials: int = 30
+    timeout: Optional[int] = 21600  # 6 hours hard cap
     study_name: str = "sentinel_tft_model_c"
     storage: str = f"sqlite:///{RESULTS_DIR / 'optuna_study.db'}"
 
-    hidden_size_range: tuple = (32, 128)
+    hidden_size_range: tuple = (32, 160)
     attention_head_range: tuple = (1, 4)
     dropout_range: tuple = (0.05, 0.3)
     learning_rate_range: tuple = (1e-4, 1e-2)
-    batch_size_choices: tuple = (32, 64, 128)
+    batch_size_choices: tuple = (32, 64)
     lstm_layers_range: tuple = (1, 3)
+
+    # Crisis-aware loss tuning
+    outer_weight_range: tuple = (1.0, 3.0)       # Quantile tail emphasis
+    crisis_scale_range: tuple = (0.5, 4.0)        # GKG z-score weight multiplier
 
 # Default configs
 DEFAULT_TFT_CONFIG = RTX_5070_LAPTOP_CONFIG
